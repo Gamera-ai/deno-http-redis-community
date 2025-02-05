@@ -74,6 +74,7 @@ export async function invoke(dbNumber, args) {
   return {}
 }
 ```
+Two example scripts are included in the project.
 
 ## Request Format
 
