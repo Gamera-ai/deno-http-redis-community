@@ -12,10 +12,82 @@ class RedisConnectionPool {
 	// Use private class fields for better encapsulation
 	#pools;
 	#inUse;
+	#cleanupInterval;
 
 	constructor() {
 		this.#pools = new Map();
 		this.#inUse = new Map();
+		// Add cleanup interval
+		this.#cleanupInterval = setInterval(() => this.#cleanupStaleConnections(), 60000);
+	}
+
+	// Add cleanup method
+	async #cleanupStaleConnections() {
+		const MAX_IDLE_TIME = 300000; // 5 minutes
+
+		for (const [dbNumber, pool] of this.#pools) {
+			const oldPool = new Map(pool);
+			for (const [client, lastUsed] of oldPool) {
+				if (Date.now() - lastUsed < MAX_IDLE_TIME) {
+					// connection is still usable
+					continue;
+				}
+
+				// connection is stale, ping it
+				try {
+					await client.ping();
+				} catch (error) {
+					console.log(`closing stale/dead connection to db ${dbNumber}`);
+
+					// connection is dead, remove it
+					pool.delete(client);
+					try {
+						await client.quit();
+					} catch (error) {
+						console.error('Error closing stale/dead connection:', error);
+					}
+
+					// add a new connection to the pool
+					await this.#addConnectionToPool(dbNumber);
+				}
+			}
+		}
+
+		// Cleanup any stuck connections in #inUse
+		for (const [client, record] of this.#inUse) {
+			if (Date.now() - record.timestamp > ACQUIRE_TIMEOUT) {
+				console.log(`closing stuck connection to db ${record.dbNumber}`);
+
+				this.#inUse.delete(client);
+				try {
+					await client.quit();
+				} catch (error) {
+					console.error('Error closing stuck connection:', error);
+				}
+
+				// add a new connection to the pool
+				await this.#addConnectionToPool(record.dbNumber);
+			}
+		}
+	}
+
+	// Add destructor method
+	async destroy() {
+		clearInterval(this.#cleanupInterval);
+
+		// Close all connections
+		for (const [, pool] of this.#pools) {
+			for (const [client] of pool) {
+				try {
+					await client.quit();
+				} catch (error) {
+					console.error('Error closing connection during cleanup:', error);
+				}
+			}
+		}
+
+		this.#pools.clear();
+		this.#inUse.clear();
 	}
 
 	async initialize(dbNumber) {
@@ -40,12 +112,20 @@ class RedisConnectionPool {
 	}
 
 	async createConnection(dbNumber) {
-		return await connect({
-			hostname: REDIS_HOST,
-			port: REDIS_PORT,
-			password: REDIS_AUTH,
-			db: dbNumber
-		});
+		if (REDIS_AUTH) {
+			return await connect({
+				hostname: REDIS_HOST,
+				port: REDIS_PORT,
+				password: REDIS_AUTH,
+				db: dbNumber
+			});
+		} else {
+			return await connect({
+				hostname: REDIS_HOST,
+				port: REDIS_PORT,
+				db: dbNumber
+			});
+		}
 	}
 
 	async acquireConnection(dbNumber) {
@@ -53,30 +133,32 @@ class RedisConnectionPool {
 			await this.initialize(dbNumber);
 		}
 
-		const pool = this.#pools.get(dbNumber);
-		const availableConnection = this.#findAvailableConnection(pool);
-		if (availableConnection) return availableConnection;
+		const connection = this.#findAvailableConnection(dbNumber);
+		if (connection) {
+			return connection;
+		}
 
-		return await this.#waitForConnection(pool, dbNumber);
+		return await this.#waitForConnection(dbNumber);
 	}
 
 	// Split into smaller, more focused methods
-	#findAvailableConnection(pool) {
+	#findAvailableConnection(dbNumber) {
+		const pool = this.#pools.get(dbNumber);
 		for (const [client] of pool) {
 			if (!this.#inUse.has(client)) {
 				pool.delete(client);
-				this.#inUse.set(client, Date.now());
+				this.#inUse.set(client, { dbNumber, timestamp: Date.now() });
 				return client;
 			}
 		}
 		return null;
 	}
 
-	async #waitForConnection(pool, dbNumber) {
+	async #waitForConnection(dbNumber) {
 		const startTime = Date.now();
 		while (Date.now() - startTime < ACQUIRE_TIMEOUT) {
 			await new Promise((resolve) => setTimeout(resolve, 100));
-			const connection = this.#findAvailableConnection(pool);
+			const connection = this.#findAvailableConnection(dbNumber);
 			if (connection) return connection;
 		}
 		throw new Error(`Timeout acquiring Redis connection for database ${dbNumber}`);
